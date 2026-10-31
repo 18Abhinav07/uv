@@ -19,6 +19,8 @@ use uv_platform_tags::{
 use uv_pypi_types::{HashDigest, Yanked};
 
 use crate::known_platform::KnownPlatform;
+use crate::pins::AbiRequirements;
+use crate::pubgrub::Range;
 use crate::resolved::ResolvedDistRef;
 
 /// A collection of distributions that have been filtered by relevance.
@@ -446,8 +448,10 @@ impl PrioritizedDist {
     /// Score each compatible variant from the index that supplied its wheel.
     pub(crate) fn scored_variants(
         &self,
+        package: &PackageName,
         metadata: &[(&IndexUrl, &VariantsJsonContent, SupportedVariantProperties)],
-    ) -> impl Iterator<Item = (WheelVariantScore<'_>, usize)> {
+        requires_python: &RequiresPython,
+    ) -> impl Iterator<Item = (WheelVariantScore<'_>, usize, AbiRequirements)> {
         let non_variant_hash =
             self.best_wheel()
                 .and_then(|(_, compatibility)| match compatibility {
@@ -469,19 +473,46 @@ impl PrioritizedDist {
                 if non_variant_hash.is_some_and(|non_variant_hash| non_variant_hash > *hash) {
                     return None;
                 }
+                if let Some((_, SourceDistCompatibility::Compatible(source_hash))) = &self.0.source
+                    && source_hash > hash
+                {
+                    return None;
+                }
+                if wheel
+                    .file
+                    .requires_python
+                    .as_ref()
+                    .is_some_and(|requirement| !requires_python.is_contained_by(requirement))
+                {
+                    return None;
+                }
                 let label = wheel.filename.variant()?;
-                let score = metadata
+                let (score, abi) = metadata
                     .iter()
                     .filter(|(source, _, _)| *source == &wheel.index)
-                    .filter_map(|(_, metadata, supported)| metadata.score_variant(label, supported))
-                    .max()?;
+                    .filter_map(|(_, metadata, supported)| {
+                        let score = metadata.score_variant(label, supported)?;
+                        let abi = metadata
+                            .abi_dependencies(label)
+                            .inspect_err(|err| debug!("Skipping wheel `{}`: {err}", wheel.filename))
+                            .ok()?;
+                        if !abi.is_empty() && &wheel.filename.name != package {
+                            return None;
+                        }
+                        Some((score, abi))
+                    })
+                    .max_by(|(a, _), (b, _)| a.cmp(b))?;
+                let abi = abi
+                    .into_iter()
+                    .map(|(name, versions)| (name, Range::from_versions(versions)))
+                    .collect();
                 let score = WheelVariantScore {
                     hash: *hash,
                     score,
                     tag_priority: *priority,
                     build_tag: build_tag.as_ref(),
                 };
-                Some((score, index))
+                Some((score, index, abi))
             })
     }
 
@@ -494,6 +525,15 @@ impl PrioritizedDist {
         }
         selected.0.best_wheel_index = Some(index);
         selected
+    }
+
+    /// One concrete wheel, without copying every other candidate into each solver choice.
+    pub(crate) fn variant_dist(&self, index: usize) -> RegistryBuiltDist {
+        RegistryBuiltDist {
+            wheels: vec![self.0.wheels[index].0.clone()],
+            best_wheel_index: 0,
+            sdist: None,
+        }
     }
 
     /// Insert the given built distribution into the [`PrioritizedDist`].
